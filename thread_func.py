@@ -7,7 +7,7 @@ from scipy.signal import find_peaks
 sizes = [100, 100, 1000,1000]
 probs = [[0.3, 0.05, 0.2, 0.01],[0.07, 0.3, 0.3, 0.01],[0.01, 0.01, 0.1, 0.01],[0.005,0.005,0.03,0.01]]
 p=np.ones(np.sum(sizes))
-#p[np."random.ranint(len(p))]="-1
+#p[np."random.ranint(len(p))]="-1 
 p[3]=-1
 
 
