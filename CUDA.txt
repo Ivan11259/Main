@@ -1,0 +1,801 @@
+DEFINITIONS######################################################################################################
+
+class pandemic:
+    def __init__(self,sizes,density,p0,
+                 age_dist=np.array([0.17538462,0.68307692,0.14153846]), #Hungary 2015
+                 directed=True,alpha=0.4,beta=0.5,
+                 gamma=0.1,pi=0.5,mu=0.05,incubation_time=10,
+                 ksi=0.01,delta=0.01,rho=0.1,nu=0.09,
+                 qtime=20,use_quarantine=True,test_precision=1,social_tracking=1):
+        """
+        _______________________________________
+        Class to implement modified SIR modell.
+        _______________________________________
+        Params:
+        sizes,density,p0: parameters of the input graph
+        beta,gamma,alpha,pi,mu,incubation_time,ksi,delta,rho,nu,qtime: parameters of the model
+        use_quarantine: implement quarainte scenario, bool, default True
+        test_precision: the precision of the used disease test, beween 0 and 1
+        social_tracking: the probability to find a connection between an infected node and one of its neighbors
+        """
+        self.sizes=sizes #size of blocks [N1,N2,N3,..] (elements qre no of nodes)
+        self.density=density #density matrix (density of connections between blocks)
+        self.plague=np.array([p0]) #stores the plague value of each node (1:S,-1:E,0:R,-2:C,-3:D)
+        self.incubation_time=incubation_time
+        self.node_no=len(p0)
+        
+        
+        self.quarantine=np.zeros((1,self.node_no)) #quarantine timer
+        self.incubation=np.zeros((1,self.node_no)) #incubation timer
+        #set up timers
+        self.incubation[0][np.ravel(np.argwhere(self.plague==-1))]=self.incubation_time
+        self.use_quarantine=use_quarantine #if we want to implement quarantine
+        self.qtime=qtime #lenght of quarantine
+        
+        
+        
+        
+        
+        #init the ages of nodes (buckets 0..len(age_dist)-1)
+        self.node_ages=np.random.choice(np.arange(len(age_dist)),size=self.node_no,p=age_dist)
+        
+        
+        #set up parameters for different ages
+        
+        
+        self.beta=beta #p(E or C infects one of its neighbor)
+        
+        #rates for E
+        #the next three HAVE TO SUM UP TO 1
+        self.gamma=gamma #p(E->R|t>t_inc)
+        self.alpha=alpha #p(E->C|t>t_inc)
+        self.pi=pi #p(E->S|t>t_inc)
+        self.mu=mu #probability that an exposed person gets tested for quarantine
+        
+        #rates for C
+        self.ksi=ksi #p(C->D)
+        self.delta=delta #p(C->R)
+        self.rho=rho #p(C->S)
+        self.nu=nu #probability that a critical person gets tested for quarantine
+        
+        
+        
+        
+        
+        
+        self.test_precision=test_precision #p(positive test|infected)
+        
+        self.social_tracking=social_tracking
+        #if we find an infected patient this is the probability that we find connection
+        #with its i-th neighbouring node
+        
+        #to put only tested node to quarantine set this to 0
+        
+        #create graph
+        self.G=nx.stochastic_block_model(sizes,probs,directed=directed,seed=123)
+        self.age=0 #age of system
+        self.A=np.array(nx.to_numpy_matrix(self.G)) #adj matrix of graph,it's an array not matrix type!
+        
+        
+        
+        #CUDA init
+        self.RA=np.empty(self.A.shape,dtype=bool) #return array
+
+        
+        self.blockdim = (32, 8) #grid and block (maybe parameter later)
+        self.griddim = (32,16) #első: hány gpu mag,hány sorozatban terhelve
+
+        self.R_image = cuda.to_device(self.RA) #copy arrays to GPU (A is static and R is temp, so one copy is enough)
+        self.A_image = cuda.to_device(self.A)
+        
+    def sort_ppl(self,pi=-1): #sort people to S,I,R
+        """
+        Return the index of node where given state patient present.
+        ___________________________________________________
+        Params:
+        pi: timestamp of the iteration to sort, Default: -1
+        ___________________________________________________
+        Returns:
+        S,E,R,C,D: arrays with index of given states
+        """
+        S=np.ravel(np.argwhere(self.plague[pi]==1))
+        E=np.ravel(np.argwhere(self.plague[pi]==-1))
+        R=np.ravel(np.argwhere(self.plague[pi]==0))
+        C=np.ravel(np.argwhere(self.plague[pi]==-2))
+        D=np.ravel(np.argwhere(self.plague[pi]==-3))
+        return S,E,R,C,D
+    
+    def reset(self): #reset the state
+        """
+        Reset the model to only intial state.
+        """
+        self.age=0
+        self.plague=np.array([self.plague[0]])
+        self.quarantine=np.zeros(len(self.plague))
+        self.incubation=np.zeros((1,len(self.plague))) #incubation timer
+        self.incubation[0][np.ravel(np.argwhere(self.plague==-1))]=self.incubation_time
+
+        
+    def get_colors_shapes(self,p,q): #different color for each disease state, diff state for quarantine
+        #, p is one row frow self.plague
+        """
+        Returns different colors and shapes for different state patients, used in plotting.
+        ________________________
+        Params:
+        p: state array of nodes
+        q: quarantine time array
+        ________________________
+        Returns:
+        """
+        colors=np.empty(len(p),dtype="U10") #colors
+        shapes=np.empty(len(q),dtype=matplotlib.path.Path) #shapes
+        if len(p)!=len(q):
+            print("ERROR IN COLORS_SHAPES")
+            return -1
+        for i in range(0,len(p)):
+            if p[i]==1: #S
+                colors[i]="tab:green"
+            elif p[i]==-1: #E
+                colors[i]="tab:orange"
+            elif p[i]==-2: #C
+                colors[i]="red"
+            elif p[i]==-3: #D
+                colors[i]="k"
+            else: #R
+                colors[i]="tab:blue"
+                
+            #does not look good but it works..
+            if q[i]==0:
+                shapes[i]=matplotlib.markers.MarkerStyle('o').get_path().transformed(
+                    matplotlib.markers.MarkerStyle('o').get_transform())
+            else:
+                shapes[i]=matplotlib.markers.MarkerStyle('s').get_path().transformed(
+                    matplotlib.markers.MarkerStyle('s').get_transform())
+            
+                
+        return colors,shapes
+        
+        
+    def plot_me(self,save=None,skip=1,interval=100,plot_seed=321,fsize=(16,9),msize=15,max_embedsize=100):
+        """
+        Function for animated plotting.
+        ______________________________
+        Params:
+        save: savefile path, if None it won't be saved
+        skip,interval: animation related.Default: 1,100
+        plot_seed: seed of nx.spring_layout.Default: 321
+        fsize: fig size.Default:(16,9)
+        msize: markersize,Default:15
+        max_embedsize: max animation size in MB.Default: 100
+        ____________________________________________________
+        Returns:
+        animation
+        
+        """
+        #animated plotting
+        frames=len(self.plague)
+        fig = plt.figure(figsize=fsize)
+        ax = fig.add_subplot(111)
+        #plot with p0
+        c,s=self.get_colors_shapes(self.plague[0],self.quarantine[0])
+        sc=nx.draw_networkx_nodes(self.G,pos=nx.spring_layout(self.G,seed=plot_seed),node_size=msize,color=c)
+        plt.axis("off")
+        
+        def draw(i):
+            c,s=self.get_colors_shapes(self.plague[i],self.quarantine[i])
+            sc.set_color(c)
+            sc.set_paths(s)
+            return sc,
+        rc('animation', html='jshtml')
+        rcParams['animation.embed_limit'] = max_embedsize #in MB
+        anim=animation.FuncAnimation(fig, draw, frames=frames, interval=interval, blit=True)
+        if save is not None:
+            anim.save(save,writer="pillow")
+        return anim
+    
+    def plot_init(self,plot_seed=321,fsize=(16,9),msize=15):
+        """
+        Plots initial stat without colorcodes.
+        """
+        #plot initial state without color code
+        fig = plt.figure(figsize=fsize)
+        ax = fig.add_subplot(111)
+        nx.draw_networkx_nodes(self.G,pos=nx.spring_layout(self.G,seed=plot_seed),ax=ax,node_size=msize,color="tab:blue")
+        
+    def get_SIR_data(self):
+        """
+        Get number of different type individuals after each step.
+        _________________________________________
+        Returns:
+        S,E,R,C,D: arrays with number of given type individual at each step.
+        """
+        #get number of S,I,R ppl after each step
+        S=np.array([])
+        E=np.array([])
+        R=np.array([])
+        C=np.array([])
+        D=np.array([])
+        for j in range(0,len(self.plague)):
+            s,i,r,c,d=self.sort_ppl(j)
+            S=np.append(S,len(s))
+            E=np.append(E,len(i))
+            R=np.append(R,len(r))
+            C=np.append(C,len(c))
+            D=np.append(D,len(d))
+        return S,E,R,C,D
+    
+    def get_Qed(self):
+        Q=np.array([])
+        for j in range(0,len(self.plague)):
+            q=np.ravel(np.argwhere(self.quarantine[j]>0))
+            Q=np.append(Q,len(q))
+        return Q
+        
+        
+        
+    def spread(self): #make one step infect or heal
+        """
+        One step of the disease outbreak.
+        -Step time
+        -Make infections
+        -Handle quarantine if needed
+        -Healing
+        """
+        self.age+=1
+        S,E,R,C,D=self.sort_ppl()
+        self.plague=np.vstack([self.plague,self.plague[-1]])
+
+        self.quarantine=np.vstack([self.quarantine,self.quarantine[-1]])
+        self.quarantine[-1][np.ravel(np.argwhere(self.quarantine[-1]>0))]-=1 # step time in quarantine
+
+        self.incubation=np.vstack([self.incubation,self.incubation[-1]])
+        self.incubation[-1][np.ravel(np.argwhere(self.incubation[-1]>0))]-=1 # step incubation time
+
+        #the last row will be the data we update
+        #print(self.age)
+        #handle exposed
+        #toc=time.time()
+        for i in range(0,len(E)):
+            if self.quarantine[-1][E[i]]==0:
+                for j in [n for n in self.G.neighbors(E[i])]:
+                    r=np.random.rand()
+                    if self.plague[-1][j]==1 and r<self.beta and self.quarantine[-1][j]==0:
+                        #with probability beta we infect each non-quarantined neighbor
+                        self.plague[-1][j]=-1
+                        #add random incubation period to newly infected node
+                        self.incubation[-1][j]=np.round(np.random.exponential(self.incubation_time))
+                if self.incubation[-1][i]==0:
+                    #after incubation period patient can get resistant,susceptible or critical
+                    state=np.random.choice([1,0,-2],p=[self.pi,self.gamma,self.alpha])
+                    self.plague[-1][E[i]]=state
+
+                #quarantine
+                #with probability mu we test patient with a "self.test_precise" precise test
+                #if produces positive test we apply quarantine to the node and its neighbors
+                if self.use_quarantine and self.plague[-1][E[i]]==-1:
+                    r=np.random.rand()
+                    if r<self.mu*self.test_precision: #with given probability and precision we test patient
+                        self.quarantine[-1][E[i]]=self.qtime #put given cell in quarainte
+                        #try to track its neighbors aswell (with given success)
+                        for j in [n for n in self.G.neighbors(E[i])]: 
+                            if self.quarantine[-1][j]==0:
+                                r=np.random.rand()
+                                if r<self.social_tracking:
+                                    self.quarantine[-1][j]=self.qtime
+
+            else: #in quaraintine incubation time still steps
+                if self.incubation[-1][E[i]]==0:
+                    #after incubation period patient can get resistant,susceptible or critical
+                    state=np.random.choice([1,0,-2],p=[self.pi,self.gamma,self.alpha])
+                    self.plague[-1][E[i]]=state
+
+        #handle critical
+        for i in range(0,len(C)):
+            if self.quarantine[-1][C[i]]==0: #if not in quarantine they can still infect
+                #print("IN")
+                for j in [n for n in self.G.neighbors(C[i])]:
+                    #print("IN j",j)
+                    r=np.random.rand()
+                    #print(self.plague[-1][j]==1,r<self.beta,self.quarantine[-1][j]==0)
+                    if self.plague[-1][j]==1 and r<self.beta and self.quarantine[-1][j]==0:
+                        #print("infect")
+                        #with probability beta we infect each non-quarantined neighbor
+                        self.plague[-1][j]=-1
+                        self.incubation[-1][j]=np.round(np.random.exponential(self.incubation_time))
+
+            if self.use_quarantine and self.plague[-1][C[i]]==-2:
+                r=np.random.rand()
+                if r<self.nu*self.test_precision: #with given probability and precision we test patient
+                    self.quarantine[-1][C[i]]=self.qtime #put given cell in quarainte
+                    #try to track its neighbors aswell (with given success)
+                    for j in [n for n in self.G.neighbors(C[i])]: 
+                        if self.quarantine[-1][j]==0:
+                            r=np.random.rand()
+                            if r<self.social_tracking:
+                                self.quarantine[-1][j]=self.qtime
+
+                #either in or not in quarantine C->R,D,S is possible
+                r=np.random.rand(3)
+                if r[0]<self.delta: #C->R
+                    self.plague[-1][C[i]]=0
+                elif r[1]<self.ksi: #C->D
+                    self.plague[-1][C[i]]=-3
+                elif r[2]<self.rho: #C->S
+                    self.plague[-1][C[i]]=1
+
+        #tic=time.time()
+        #print(tic-toc)               
+                    
+    def spread2(self):
+        #improved spread function
+        self.age+=1
+        #S,E,R,C,D=self.sort_ppl()
+        self.plague=np.vstack([self.plague,self.plague[-1]])
+        
+        self.quarantine=np.vstack([self.quarantine,self.quarantine[-1]])
+        self.quarantine[-1][np.ravel(np.argwhere(self.quarantine[-1]>0))]-=1 # step time in quarantine
+        
+        self.incubation=np.vstack([self.incubation,self.incubation[-1]])
+        self.incubation[-1][np.ravel(np.argwhere(self.incubation[-1]>0))]-=1 # step incubation time
+        
+        
+        #infections for E and C
+        #toc=time.time()
+        
+        r=np.random.rand(self.node_no)#random number for each node
+        
+        
+        q=(self.quarantine[-1]==0) #non quaraintinised nodes
+        h=((self.plague[-1]==-1)+(self.plague[-1]==-2))*q #non quarantinised infectors (S,C) (hunter matrix)
+        t=(self.plague[-1]==1)*q #non quarantinised susceptiles (target vector)
+        
+        #toc2=time.time()
+        
+        aht=(self.A.T*h).T*t #which infections are possible (one is S/C one is S,none is Q)
+        
+        infect=(aht.T*self.beta).T>r #randomness
+        
+        #tic2=time.time()
+        #print(tic2-toc2)
+        
+        self.plague[-1][np.any(infect,axis=0)]=-1
+        new_inf=len(self.incubation[-1][np.any(infect,axis=0)]) #number of new infections (maybe useful later)
+        
+        #set incubation time for new infected
+        self.incubation[-1][np.any(infect,axis=0)]=np.round(np.random.exponential(self.incubation_time,size=new_inf))
+        
+    def spread_sparse(self):
+        #improved spread function
+        self.age+=1
+        #S,E,R,C,D=self.sort_ppl()
+        self.plague=np.vstack([self.plague,self.plague[-1]])
+
+        self.quarantine=np.vstack([self.quarantine,self.quarantine[-1]])
+        self.quarantine[-1][np.ravel(np.argwhere(self.quarantine[-1]>0))]-=1 # step time in quarantine
+
+        self.incubation=np.vstack([self.incubation,self.incubation[-1]])
+        self.incubation[-1][np.ravel(np.argwhere(self.incubation[-1]>0))]-=1 # step incubation time
+
+
+        #infections for E and C
+        #toc=time.time()
+
+        r=np.random.rand(self.node_no)#random number for each node
+
+
+        q=(self.quarantine[-1]==0) #non quaraintinised nodes
+        h=((self.plague[-1]==-1)+(self.plague[-1]==-2))*q #non quarantinised infectors (S,C) (hunter matrix)
+        t=(self.plague[-1]==1)*q #non quarantinised susceptiles (target vector)
+
+        #toc2=time.time()
+
+        sparsetmp=csr_matrix(self.A)
+        sparsetmp=csr_matrix(sparsetmp.T.toarray()*h)
+        sparsetmp=csr_matrix(sparsetmp.T.toarray()*t) #which infections are possible (one is S/C one is S,none is Q)
+        #print(sparsetmp.toarray())
+        sparsetmp=csr_matrix(sparsetmp.T.toarray()*self.beta)
+        infect=sparsetmp.T.toarray()>r #randomness
+
+        #tic2=time.time()
+        #print(tic2-toc2)
+
+        self.plague[-1][np.any(infect,axis=0)]=-1
+        new_inf=len(self.incubation[-1][np.any(infect,axis=0)]) #number of new infections (maybe useful later)
+
+        #set incubation time for new infected
+        self.incubation[-1][np.any(infect,axis=0)]=np.round(np.random.exponential(self.incubation_time,size=new_inf))
+        
+        
+    def spread_sparse2(self):
+        #improved spread function
+        self.age+=1
+        #S,E,R,C,D=self.sort_ppl()
+        self.plague=np.vstack([self.plague,self.plague[-1]])
+
+        self.quarantine=np.vstack([self.quarantine,self.quarantine[-1]])
+        self.quarantine[-1][np.ravel(np.argwhere(self.quarantine[-1]>0))]-=1 # step time in quarantine
+
+        self.incubation=np.vstack([self.incubation,self.incubation[-1]])
+        self.incubation[-1][np.ravel(np.argwhere(self.incubation[-1]>0))]-=1 # step incubation time
+
+
+        #infections for E and C
+        #toc=time.time()
+
+        r=np.random.rand(self.node_no)#random number for each node
+
+
+        q=(self.quarantine[-1]==0) #non quaraintinised nodes
+        h=((self.plague[-1]==-1)+(self.plague[-1]==-2))*q #non quarantinised infectors (S,C) (hunter matrix)
+        t=(self.plague[-1]==1)*q #non quarantinised susceptiles (target vector)
+
+        #toc2=time.time()
+
+        #sparsetmp=csr_matrix(A)
+        aht=sparse.coo_matrix(self.A).T.multiply(h).T.multiply(t)
+        infect=(aht.T.multiply(self.beta)).T.toarray()>r #randomness
+
+        #tic2=time.time()
+        #print(tic2-toc2)
+
+        self.plague[-1][np.any(infect,axis=0)]=-1
+        new_inf=len(self.incubation[-1][np.any(infect,axis=0)]) #number of new infections (maybe useful later)
+
+        #set incubation time for new infected
+        self.incubation[-1][np.any(infect,axis=0)]=np.round(np.random.exponential(self.incubation_time,size=new_inf))
+        
+        
+        
+    def spread_TEST(self):
+        #improved spread function
+        self.age+=1
+        #S,E,R,C,D=self.sort_ppl()
+        self.plague=np.vstack([self.plague,self.plague[-1]])
+
+        self.quarantine=np.vstack([self.quarantine,self.quarantine[-1]])
+        self.quarantine[-1][np.ravel(np.argwhere(self.quarantine[-1]>0))]-=1 # step time in quarantine
+
+        self.incubation=np.vstack([self.incubation,self.incubation[-1]])
+        self.incubation[-1][np.ravel(np.argwhere(self.incubation[-1]>0))]-=1 # step incubation time
+
+
+        #infections for E and C
+        #toc=time.time()
+
+        r=np.random.rand(self.node_no)#random number for each node
+
+
+        q=(self.quarantine[-1]==0) #non quaraintinised nodes
+        h=((self.plague[-1]==-1)+(self.plague[-1]==-2))*q #non quarantinised infectors (S,C) (hunter matrix)
+        t=(self.plague[-1]==1)*q #non quarantinised susceptiles (target vector)
+
+        #toc2=time.time()
+
+        ti=np.argwhere(~t)
+        hi=np.argwhere(~h)
+        B=np.delete(np.delete(self.A,hi,axis=0),ti,axis=1)
+        r=np.random.rand(B.shape[1])
+        infect=(B.T*self.beta).T>r
+
+        #tic2=time.time()
+        #print(tic2-toc2)
+        self.plague[-1][np.flatnonzero(t)[np.any(infect,axis=0)]]=-1
+        new_inf=len(self.incubation[-1][np.flatnonzero(t)[np.any(infect,axis=0)]]) #number of new infections (maybe useful later)
+
+        #set incubation time for new infected
+        self.incubation[-1][np.flatnonzero(t)[np.any(infect,axis=0)]]=np.round(np.random.exponential(self.incubation_time,size=new_inf))
+
+    def CUDA_spread(self):
+            
+        #toc=time.time()
+        self.age+=1
+        self.plague=np.vstack([self.plague,self.plague[-1]])
+        self.quarantine=np.vstack([self.quarantine,self.quarantine[-1]])
+        self.quarantine[-1][np.ravel(np.argwhere(self.quarantine[-1]>0))]-=1 # step time in quarantine
+
+        self.incubation=np.vstack([self.incubation,self.incubation[-1]])
+        self.incubation[-1][np.ravel(np.argwhere(self.incubation[-1]>0))]-=1 # step incubation time
+        
+        """
+        tic=time.time()
+        print("Step time:",tic-toc)#"""
+        
+        
+        #toc=time.time()
+        e=(self.plague[-1]==-1)
+        c=(self.plague[-1]==-2)
+        
+        q=(self.quarantine[-1]==0) #non quaraintinised nodes
+        inc_over=e*(self.incubation[-1]==0)
+        h=(e+c)*q #non quarantinised infectors (S,C) (hunter vector)
+        t=(self.plague[-1]==1)*q #non quarantinised susceptiles (target vector)
+
+        #random number for each node
+        r=np.random.rand(self.A.shape[1])
+        """
+        tic=time.time()
+        print("Setup arrays:",tic-toc)#"""
+        
+        #toc=time.time()
+        
+        #spread on GPU and get the return array
+        _CUDA_spread[self.griddim, self.blockdim](self.A_image,r,self.beta,h,t,self.R_image) 
+        self.R_image.to_host()
+        
+        """
+        tic=time.time()
+        print("GPU compute:",tic-toc)#"""
+        
+        
+        #toc=time.time()
+        
+        #infect the new nodes
+        self.plague[-1][np.any(self.RA,axis=0)]=-1
+
+        new_inf=len(self.incubation[-1][np.any(self.RA,axis=0)])
+        self.incubation[-1][np.any(self.RA,axis=0)]=np.round(np.random.exponential(self.incubation_time,size=new_inf))
+        """
+        tic=time.time()
+        print("Infect, set incubation:",tic-toc)#"""
+        
+        #incubation time over
+        #toc=time.time()
+        self.plague[-1][inc_over]=np.random.choice([1,0,-2],size=np.sum(inc_over),p=[self.pi,self.gamma,self.alpha])
+        
+        """
+        tic=time.time()
+        print("Incubation over:",tic-toc)#"""
+        
+        
+        #toc=time.time()
+        #critical transitions (1:S,-1:E,0:R,-2:C,-3:D)
+        self.plague[-1][c]=np.random.choice([0,1,-3,-2],size=np.sum(c)
+                                            ,p=[self.delta,self.rho,self.ksi,1-(self.delta+self.rho+self.ksi)])
+        
+        """#critical->S
+        self.plague[-1][c]=np.random.choice(
+            [1,-2],size=np.sum(c),p=[self.rho,1-self.rho])
+        
+        #critical->D
+        self.plague[-1][c]=np.random.choice(
+            [-3,-2],size=np.sum(c),p=[self.ksi,1-self.ksi])
+        """
+        """
+        tic=time.time()
+        print("Critical transition:",tic-toc)#"""
+        
+        
+        #toc=time.time()
+        #quarantine (szomszédokra is kellene!)
+        
+        if self.use_quarantine and self.qtime!=0:
+            #for S
+            self.quarantine[-1][self.plague[-1]==-1]=np.random.choice(
+                [self.qtime,0],size=np.sum(self.plague[-1]==-1)
+                ,p=[self.mu*self.test_precision,1-self.mu*self.test_precision])
+
+            #for C
+            self.quarantine[-1][self.plague[-1]==-2]=np.random.choice(
+                [self.qtime,0],size=np.sum(self.plague[-1]==-2)
+                ,p=[self.nu*self.test_precision,1-self.nu*self.test_precision])
+
+            #for neighbors
+            newq=np.ravel(np.argwhere(((
+                covid.plague[-1]==-1)+(covid.plague[-1]==-2))*(covid.quarantine[-1]==covid.qtime))) #newly Qed ppl
+            if len(newq)!=0:
+                nei=np.ravel(np.argwhere(covid.A[newq][2])) #index of neighbors of newly Qed
+            self.quarantine[-1][nei]=np.random.choice(
+                [self.qtime,0],size=len(nei)
+                ,p=[self.social_tracking,1-self.social_tracking])
+            
+                                
+        """
+        tic=time.time()
+        print("Quarantine:",tic-toc)#"""
+        
+            
+            
+#global CUDA functions
+def _CUDA_compare(Aij,rj,betai,hi,tj):
+    return (betai*tj*hi*Aij)>rj
+
+_CUDA_eval = cuda.jit(device=True)(_CUDA_compare)
+
+@cuda.jit
+def _CUDA_spread(A,r,beta,h,t,RET):
+    startX, startY = cuda.grid(2)
+    gridX = cuda.gridDim.x * cuda.blockDim.x;
+    gridY = cuda.gridDim.y * cuda.blockDim.y;
+    
+    for j in range(startX, A.shape[1], gridX):
+        for i in range(startY, A.shape[0], gridY): 
+            RET[i, j] = _CUDA_eval(A[i, j], r[j], beta,h[i],t[j])
+        
+        
+def record_2Dmap(ti,tq,iter_per_pair=10,max_iter=100):
+    #brute force 2D simulation for incubation and quaraintine time
+    result=np.zeros((len(ti),len(tq)))
+    for i in range(len(ti)):
+        for j in range(len(tq)):
+            for k in range(0,iter_per_pair):
+                covid=pandemic(sizes,probs,p,incubation_time=ti[i],qtime=tq[j])
+                for l in range(0,max_iter):
+                    covid.spread()
+                x=covid.get_SIR_data()[1]
+                xf=savgol_filter(x,5,2) #filtering the resulted curve (remove unvanted peaks)
+                peaks, _ = find_peaks(xf, distance=10) #finding the peaks
+                result[i,j]+=len(peaks) #number of peaks
+            result[i,j]/=iter_per_pair #avg
+            
+    return result #return the 2D plot data
+
+
+CUDA#############################################################################################################
+
+sizes = [100, 100, 1000,1000]
+probs = [[0.3, 0.05, 0.2, 0.01],[0.07, 0.3, 0.3, 0.01],[0.01, 0.01, 0.1, 0.01],[0.005,0.005,0.03,0.01]]
+#probs=np.ones((4,4))
+p=np.ones(np.sum(sizes))
+#p[np.random.ranint(len(p))]=-1
+p[3]=-1
+
+beta=0.5 #p(E or C infects neighbor|not in quarantine)
+
+#these have to sum up to 1...
+gamma=0.1 #p(E->R)
+alpha=0.4 #p(E->C)
+pi=0.5 #p(E->S)
+
+mu=0.005 #p(E->quaraintine)
+inc_time=10 #incubation time
+
+
+ksi=0.001 #p(C->D)
+delta=0.01 #p(C->R)
+rho=0.1 #p(C->S)
+
+nu=0.06 #p(C->quaraintine)
+
+qtime=15 #quarantine time
+
+
+
+
+for j in range(0,2):
+    #np.random.seed(223)
+    covid=pandemic(sizes,probs,p,use_quarantine=False)
+    toc=time.time()
+    for i in range(0,200):
+        #print("\nAge",covid.age)
+        covid.CUDA_spread()
+    tic=time.time()
+    print("Runtime:",tic-toc,"s")
+
+    S,E,R,C,D=covid.get_SIR_data()
+    Q=covid.get_Qed()
+    if j==0:
+        s=np.array(S)
+        e=np.array(E)
+        r=np.array(R)
+        c=np.array(C)
+        d=np.array(D)
+        q=np.array(Q)
+    else:
+        s=np.vstack((s,S))
+        e=np.vstack((e,E))
+        r=np.vstack((r,R))
+        c=np.vstack((c,C))
+        d=np.vstack((d,D))
+        q=np.vstack((q,Q))
+        
+fig=plt.figure()
+ax=plt.subplot(111)
+for j in range(0,2):
+    if j==0:
+        ax.plot(s[j],label="S",color="tab:green")
+        ax.plot(e[j],label="E",color="tab:orange")
+        ax.plot(r[j],label="R",color="gray")
+        ax.plot(c[j],label="C",color="red")
+        ax.plot(d[j],label="D",color="k")
+        ax.plot(q[j],label="Q",color="tab:blue")
+    else:
+        ax.plot(s[j],color="tab:green")
+        ax.plot(e[j],color="tab:orange")
+        ax.plot(r[j],color="gray")
+        ax.plot(c[j],color="red")
+        ax.plot(d[j],color="k")
+        ax.plot(q[j],color="tab:blue")
+        
+ax.set_title("$t_{inc}=$"+str(covid.incubation_time)+" ; $t_{q}=$"+str(covid.qtime),fontsize=20)        
+ax.set_ylabel("N",fontsize=20)
+ax.set_xlabel("t",fontsize=20)
+plt.setp(ax.get_xticklabels(), fontsize=20)
+plt.setp(ax.get_yticklabels(), fontsize=20)
+
+ax.legend(fontsize=20)
+
+
+
+
+CPU###############################################################################################################
+
+sizes = [100, 100, 1000,1000]
+probs = [[0.3, 0.05, 0.2, 0.01],[0.07, 0.3, 0.3, 0.01],[0.01, 0.01, 0.1, 0.01],[0.005,0.005,0.03,0.01]]
+p=np.ones(np.sum(sizes))
+#p[np.random.ranint(len(p))]=-1
+p[3]=-1
+
+beta=0.5 #p(E or C infects neighbor|not in quarantine)
+
+#these have to sum up to 1...
+gamma=0.1 #p(E->R)
+alpha=0.4 #p(E->C)
+pi=0.5 #p(E->S)
+
+mu=0.05 #p(E->quaraintine)
+inc_time=10 #incubation time
+
+
+ksi=0.01 #p(C->D)
+delta=0.01 #p(C->R)
+rho=0.1 #p(C->S)
+
+nu=0.06 #p(C->quaraintine)
+
+qtime=20 #quarantine time
+
+
+
+
+for j in range(0,2):
+    #np.random.seed(223)
+    covid=pandemic(sizes,probs,p,use_quarantine=False)
+    toc=time.time()
+    for i in range(0,200):
+        #print("\nAge",covid.age)
+        covid.spread()
+    tic=time.time()
+    print("Runtime:",tic-toc,"s")
+
+    S,E,R,C,D=covid.get_SIR_data()
+    Q=covid.get_Qed()
+    if j==0:
+        s=np.array(S)
+        e=np.array(E)
+        r=np.array(R)
+        c=np.array(C)
+        d=np.array(D)
+        q=np.array(Q)
+    else:
+        s=np.vstack((s,S))
+        e=np.vstack((e,E))
+        r=np.vstack((r,R))
+        c=np.vstack((c,C))
+        d=np.vstack((d,D))
+        q=np.vstack((q,Q))
+    
+fig=plt.figure()
+ax=plt.subplot(111)
+for j in range(0,2):
+    if j==0:
+        ax.plot(s[j],label="S",color="tab:green")
+        ax.plot(e[j],label="E",color="tab:orange")
+        ax.plot(r[j],label="R",color="gray")
+        ax.plot(c[j],label="C",color="red")
+        ax.plot(d[j],label="D",color="k")
+        ax.plot(q[j],label="Q",color="tab:blue")
+    else:
+        ax.plot(s[j],color="tab:green")
+        ax.plot(e[j],color="tab:orange")
+        ax.plot(r[j],color="gray")
+        ax.plot(c[j],color="red")
+        ax.plot(d[j],color="k")
+        ax.plot(q[j],color="tab:blue")
+        
+ax.set_title("$t_{inc}=$"+str(covid.incubation_time)+" ; $t_{q}=$"+str(covid.qtime),fontsize=20)        
+ax.set_ylabel("N",fontsize=20)
+ax.set_xlabel("t",fontsize=20)
+plt.setp(ax.get_xticklabels(), fontsize=20)
+plt.setp(ax.get_yticklabels(), fontsize=20)
+
+ax.legend(fontsize=20)
